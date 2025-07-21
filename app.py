@@ -139,6 +139,93 @@ class StreamlitCricketAnalyzer:
             'umpire': 0, 'wicket-keeper': 0, 'stumps': 0
         }
         self.prediction_history = []
+        self.last_prediction_frame = -100  # For cooldown
+        self.COOLDOWN_FRAMES = 20
+        self.last_non_waiting_prediction = "Waiting"
+        self.prediction_display_counter = 0
+        self.PREDICTION_DISPLAY_FRAMES = 20  # Show prediction for 20 frames
+        self.last_ball_center = None
+        self.ball_speed_threshold = 5  # Low value: pre-release
+        self.GRAPH_HISTORY = 20  # Number of frames to show in graph
+        
+    def draw_shot_confidence_graph(self, frame):
+        if len(self.prediction_history) < 2:
+            return frame
+        # List of real shot types (no 'Waiting'), replace 'Cut' with 'Loft Shot'
+        all_shots = [
+            "Cover Drive", "Pull Shot", "Straight Drive", "Leg Glance", "Square Cut", "Loft Shot", "Defensive Block"
+        ]
+        N = self.GRAPH_HISTORY
+        history = [s for s in self.prediction_history[-N:] if s in all_shots]
+        shot_freq = {shot: 0 for shot in all_shots}
+        for shot in history:
+            if shot in shot_freq:
+                shot_freq[shot] += 1
+        total = sum(shot_freq.values())
+        confidences = [shot_freq[shot] / total if total > 0 else 0 for shot in all_shots]
+        # Smaller graph size
+        bar_width = 50
+        bar_gap = 30
+        label_height = 24
+        extra_right_padding = 40  # Add extra width for last label
+        graph_height = 220 + label_height  # Extra space for labels
+        graph_width = len(all_shots) * (bar_width + bar_gap) + bar_gap + extra_right_padding
+        # Create transparent overlay
+        overlay = np.zeros((graph_height, graph_width, 4), dtype=np.uint8)
+        # Draw more transparent background
+        bg_color = (20, 20, 20, 160)
+        cv2.rectangle(overlay, (0, 0), (graph_width-1, graph_height-1), bg_color, -1, lineType=cv2.LINE_AA)
+        def draw_text(img, text, pos, font, scale, color, thickness, shadow=True):
+            x, y = pos
+            if shadow:
+                cv2.putText(img, text, (x+2, y+2), font, scale, (0,0,0,255), thickness+2, cv2.LINE_AA)
+            cv2.putText(img, text, (x, y), font, scale, color, thickness, cv2.LINE_AA)
+        # Color palette for bars (bold, high-contrast, more transparent)
+        palette = [
+            (0, 128, 255, 180), (0, 200, 0, 180), (255, 128, 0, 180), (128, 0, 255, 180), (255, 0, 128, 180), (0, 255, 255, 180), (255, 0, 0, 180)
+        ]
+        # Draw bars for all shots
+        for i, (shot, conf) in enumerate(zip(all_shots, confidences)):
+            x = bar_gap + i * (bar_width + bar_gap)
+            # If confidence >= 0.05, draw bar at full height
+            if conf >= 0.05:
+                bar_h = graph_height-label_height-60
+                y = 30
+            else:
+                bar_h = int(conf * (graph_height-label_height-60))
+                y = int((1-conf) * (graph_height-label_height-60)) + 30
+            color = palette[i % len(palette)]
+            # Draw drop shadow for bar
+            shadow_offset = 4
+            cv2.rectangle(overlay, (x+shadow_offset, y+shadow_offset), (x+bar_width+shadow_offset, graph_height-label_height-30+shadow_offset), (0,0,0,80), -1, lineType=cv2.LINE_AA)
+            cv2.ellipse(overlay, (x+bar_width//2+shadow_offset, y+shadow_offset), (bar_width//2, 10), 0, 0, 180, (0,0,0,80), -1, lineType=cv2.LINE_AA)
+            # Draw bar
+            cv2.rectangle(overlay, (x, y), (x+bar_width, graph_height-label_height-30), color, -1, lineType=cv2.LINE_AA)
+            cv2.ellipse(overlay, (x+bar_width//2, y), (bar_width//2, 10), 0, 0, 180, color, -1, lineType=cv2.LINE_AA)
+            # Only show the first word of each shot name, centered under the bar, and shift text higher
+            if shot == "Loft Shot":
+                label = "Lofted"
+            else:
+                label = shot.split()[0]
+            (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            label_x = x + int(bar_width/2) - int(label_w/2)
+            # Add extra spacing before 'Defensive' label
+            if shot == "Defensive Block":
+                label_x += 10  # Shift 'Defensive' label right by 10 pixels
+            label_y = graph_height - int(label_height/2) - 4  # Shift up by 4 pixels
+            draw_text(overlay, label, (label_x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255,255), 2)
+        # Overlay graph on frame (bottom left, but shifted right)
+        fh, fw = frame.shape[:2]
+        gh, gw = overlay.shape[:2]
+        x_offset = 40  # Shift right
+        y_offset = fh - gh - 30
+        if y_offset < 0: y_offset = 0
+        roi = frame[y_offset:y_offset+gh, x_offset:x_offset+gw]
+        overlay_bgr = overlay[...,:3]
+        alpha = overlay[...,3:] / 255.0
+        blended = (overlay_bgr * alpha + roi * (1 - alpha)).astype(np.uint8)
+        frame[y_offset:y_offset+gh, x_offset:x_offset+gw] = blended
+        return frame
         
     def process_frame(self, frame, frame_count):
         """Process a single frame and return analysis results"""
@@ -231,11 +318,41 @@ class StreamlitCricketAnalyzer:
         
         # Analysis
         self.shot_predictor.add_frame_data(current_frame_objects, batsman_box)
-        shot_prediction = self.shot_predictor.predict_shot(frame.shape[1])
-        
         # Bowling analysis
         bowler_in_area = self.bowling_trigger.check_bowler_in_area(tracked_objects, self.cricket_zones, frame_count)
         self.bowling_trigger.analyze_fielding_gaps(current_frame_objects, frame.shape[1])
+        # Ball speed calculation for pre-release detection
+        ball_objects = [obj for obj in current_frame_objects if obj['class'] == 'ball']
+        if ball_objects:
+            ball_center = get_box_center(ball_objects[0]['box'])
+            if self.last_ball_center is not None:
+                ball_speed = np.linalg.norm(np.array(ball_center) - np.array(self.last_ball_center))
+            else:
+                ball_speed = 0
+            self.last_ball_center = ball_center
+        else:
+            ball_speed = 0
+        # Only predict shot ONCE per delivery, just before release (ball speed low)
+        if (
+            self.bowling_trigger.should_trigger_prediction(frame_count)
+            and (frame_count - self.last_prediction_frame > self.COOLDOWN_FRAMES)
+            and (ball_speed < self.ball_speed_threshold)
+        ):
+            shot_prediction = self.shot_predictor.predict_shot(frame.shape[1])
+            self.last_prediction_frame = frame_count
+            prediction_frame = frame_count
+            self.last_non_waiting_prediction = shot_prediction
+            self.prediction_display_counter = self.PREDICTION_DISPLAY_FRAMES
+        else:
+            shot_prediction = "Waiting"
+            prediction_frame = self.last_prediction_frame
+            if self.prediction_display_counter > 0:
+                self.prediction_display_counter -= 1
+        # For UI display:
+        if self.prediction_display_counter > 0:
+            ui_shot_prediction = self.last_non_waiting_prediction
+        else:
+            ui_shot_prediction = "Waiting"
         
         # Ball trajectory analysis
         ball_objects = [obj for obj in current_frame_objects if obj['class'] == 'ball']
@@ -251,7 +368,7 @@ class StreamlitCricketAnalyzer:
         ideal_shot = self.analysis_engine.calculate_ideal_shot(ball_length, self.bowling_trigger.fielding_gaps, game_mood)
         
         # Update overlay system
-        self.overlay_system.update_analysis(ideal_shot, ball_length, shot_prediction, game_mood)
+        self.overlay_system.update_analysis(ideal_shot, ball_length, ui_shot_prediction, game_mood)
         
         # Add logs
         if frame_count % 30 == 0:
@@ -263,6 +380,7 @@ class StreamlitCricketAnalyzer:
         analysis_data = {
             'frame': frame_count,
             'shot_prediction': shot_prediction,
+            'prediction_frame': prediction_frame,
             'ball_length': ball_length,
             'ideal_shot': ideal_shot,
             'game_mood': game_mood,
@@ -276,6 +394,8 @@ class StreamlitCricketAnalyzer:
         
         # Draw overlays
         self.overlay_system.draw_overlays(frame)
+        # Draw shot confidence graph in bottom right
+        frame = self.draw_shot_confidence_graph(frame)
         
         return frame, analysis_data
 
@@ -393,7 +513,7 @@ def main():
                         fig1 = px.bar(detection_df, x='Object', y='Count', 
                                      title="Object Detection Statistics",
                                      color='Count', color_continuous_scale='viridis')
-                        detection_chart.plotly_chart(fig1, use_container_width=True)
+                        detection_chart.plotly_chart(fig1, use_container_width=True, key=f"detection_chart_{frame_count}")
                         
                         # Prediction history
                         if len(st.session_state.analyzer.prediction_history) > 0:
@@ -403,7 +523,7 @@ def main():
                             })
                             fig2 = px.line(prediction_df, x='Frame', y='Prediction', 
                                           title="Shot Prediction History")
-                            prediction_chart.plotly_chart(fig2, use_container_width=True)
+                            prediction_chart.plotly_chart(fig2, use_container_width=True, key=f"prediction_chart_{frame_count}")
                     
                     frame_count += frame_step
                     
@@ -448,13 +568,13 @@ def main():
                         prediction_counts = analysis_df['shot_prediction'].value_counts()
                         fig = px.pie(values=prediction_counts.values, names=prediction_counts.index,
                                    title="Shot Prediction Distribution")
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, use_container_width=True, key="final_pie_chart")
                     
                     with col2:
                         # Objects detected over time
                         fig = px.line(analysis_df, x='frame', y='objects_detected',
                                     title="Objects Detected Over Time")
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, use_container_width=True, key="final_line_chart")
                 
                 # Download results
                 st.markdown("### 💾 Download Results")

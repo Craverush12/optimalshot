@@ -217,14 +217,15 @@ class BowlingAreaTrigger:
     
     def should_trigger_prediction(self, frame_count):
         """Determine if we should trigger a new prediction"""
-        # Trigger prediction if bowler just entered area (within last 10 frames)
-        if self.bowler_in_area and frame_count - self.last_bowler_detection <= 10:
-            if not self.prediction_triggered:
-                self.prediction_triggered = True
-                return True
-        else:
+        # Only trigger prediction ONCE per delivery, when bowler just enters area
+        if self.bowler_in_area and not self.prediction_triggered:
+            # Only trigger if bowler was not in area in previous frame
+            self.prediction_triggered = True
+            self.last_bowler_detection = frame_count
+            return True
+        elif not self.bowler_in_area:
+            # Reset trigger when bowler leaves area
             self.prediction_triggered = False
-        
         return False
     
     def get_enhanced_prediction(self):
@@ -527,42 +528,37 @@ class AnalysisSidebar:
             x = self.x_offset
         if y is None:
             y = self.y_offset
-        
         frame_height, frame_width = frame.shape[:2]
-        
-        # Draw four completely independent sections aligned vertically
-        section_width = 300  # Width for each independent section
-        section_height = 80  # Height for each section
-        section_spacing = 20  # Space between independent sections
-        
+        # Bigger box sizes, slightly smaller text
+        section_width = 290
+        section_height = 115
+        title_height = 32
+        value_height = section_height - title_height
+        section_spacing = 32
+        value_padding = 28
         for i, (label, prediction) in enumerate(self.predictions.items()):
-            # Calculate section position - each section is independent
             section_x = x
             section_y = y + (i * (section_height + section_spacing))
-            
-            # Draw independent section background
-            cv2.rectangle(frame, (section_x, section_y), (section_x + section_width, section_y + section_height), 
-                         (0, 0, 0), -1)  # Black background
-            
-            # Draw independent section border
-            cv2.rectangle(frame, (section_x, section_y), (section_x + section_width, section_y + section_height), 
-                         (100, 100, 100), 2)  # Grey border
-            
-            # Draw section title (each section has its own title)
+            # Draw blue title area
+            cv2.rectangle(frame, (section_x, section_y), (section_x + section_width, section_y + title_height), (184, 95, 0), -1)  # BGR for #005FB8
+            # Draw semi-transparent white value area (taller)
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (section_x, section_y + title_height), (section_x + section_width, section_y + section_height), (236, 236, 236), -1)  # #ECECEC
+            alpha = 0.5
+            frame[section_y + title_height:section_y + section_height, section_x:section_x + section_width] = cv2.addWeighted(
+                overlay[section_y + title_height:section_y + section_height, section_x:section_x + section_width], alpha,
+                frame[section_y + title_height:section_y + section_height, section_x:section_x + section_width], 1 - alpha, 0)
+            # Centered white title text (slightly smaller)
             label_text = label.replace('_', ' ').title()
-            cv2.putText(frame, label_text, (section_x + 10, section_y + 20), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)  # White title text
-            
-            # Draw green prediction box
-            box_y = section_y + 35
-            box_height = 30
-            box_width = section_width - 20
-            cv2.rectangle(frame, (section_x + 10, box_y), (section_x + 10 + box_width, box_y + box_height), 
-                         (0, 200, 0), -1)  # Green background
-            
-            # Draw prediction text in green box
-            cv2.putText(frame, prediction, (section_x + 15, box_y + 20), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)  # Black text
+            (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.85, 2)
+            tx = section_x + (section_width - tw) // 2
+            ty = section_y + title_height - 10
+            cv2.putText(frame, label_text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
+            # Centered value text (slightly smaller)
+            (vw, vh), _ = cv2.getTextSize(prediction, cv2.FONT_HERSHEY_SIMPLEX, 1.1, 3)
+            vx = section_x + (section_width - vw) // 2
+            vy = section_y + title_height + value_padding + vh
+            cv2.putText(frame, prediction, (vx, vy), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (30, 30, 30), 3, cv2.LINE_AA)
 
 class TextOverlay:
     """Floating text overlay for logs in top-right corner"""
@@ -585,44 +581,50 @@ class TextOverlay:
         self.logs = []
     
     def draw(self, frame):
-        """Draw floating logs in top-right corner"""
+        """Draw floating logs in top-right corner inside a semi-transparent box, aligned in level with the left overlays"""
         frame_height, frame_width = frame.shape[:2]
-        
         # Calculate starting position (top-right corner)
-        start_x = frame_width - self.margin_x
-        start_y = self.margin_y
-        
-        # Draw logs with large white text
-        current_y = start_y
-        
-        for i, log in enumerate(self.logs):
-            # Ensure log is a string
-            log_text = str(log)
-            
-            # Calculate text position (right-aligned)
-            font_scale = 1.0  # Larger font for better visibility
-            thickness = 3     # Thicker text for better readability
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            
-            # Get text size for right alignment
+        padding_x = 50  # Increased padding for bigger box
+        padding_y = 30  # Increased padding for bigger box
+        # Use same alpha as bottom overlay
+        box_alpha = 160 / 255.0
+        right_margin = 40
+        # Prepare log lines
+        log_lines = [str(log) for log in self.logs[:10]]
+        font_scale = 1.0
+        thickness = 3
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        # Calculate max width and total height
+        max_width = 0
+        total_height = 0
+        line_height = 0
+        for log_text in log_lines:
             (text_width, text_height), baseline = cv2.getTextSize(log_text, font, font_scale, thickness)
-            text_x = start_x - text_width - 40  # 40 pixels from right edge
-            
-            # Draw bullet point (large white circle)
-            cv2.circle(frame, (text_x - 25, current_y - 8), 5, (255, 255, 255), -1)
-            
-            # Draw black outline for better readability
-            cv2.putText(frame, log_text, (text_x, current_y), 
-                       font, font_scale, (0, 0, 0), thickness + 2)  # Black outline
-            
-            # Draw white text
-            cv2.putText(frame, log_text, (text_x, current_y), 
-                       font, font_scale, (255, 255, 255), thickness)  # White text
-            
-            current_y += self.line_height
-            
-            # Limit to prevent overflow
-            if i >= 10:  # Show max 10 logs
+            max_width = max(max_width, text_width)
+            line_height = max(line_height, text_height + baseline)
+        total_height = line_height * len(log_lines)
+        # Box dimensions
+        box_width = max_width + 2 * padding_x
+        box_height = total_height + 2 * padding_y
+        # Box position (top right, aligned in level with left overlays)
+        box_x = frame_width - box_width - right_margin
+        box_y = 40
+        # Draw semi-transparent dark box (same as graph overlay)
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (box_x, box_y), (box_x + box_width, box_y + box_height), (20, 20, 20), -1)
+        frame[box_y:box_y+box_height, box_x:box_x+box_width] = cv2.addWeighted(
+            overlay[box_y:box_y+box_height, box_x:box_x+box_width], box_alpha,
+            frame[box_y:box_y+box_height, box_x:box_x+box_width], 1 - box_alpha, 0)
+        # Draw logs inside the box
+        current_y = box_y + padding_y + line_height - 8
+        for i, log_text in enumerate(log_lines):
+            (text_width, text_height), baseline = cv2.getTextSize(log_text, font, font_scale, thickness)
+            text_x = box_x + padding_x
+            # Draw white text with black outline for readability
+            cv2.putText(frame, log_text, (text_x, current_y), font, font_scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+            cv2.putText(frame, log_text, (text_x, current_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+            current_y += line_height
+            if i >= 9:
                 break
 
 class CricketOverlaySystem:
